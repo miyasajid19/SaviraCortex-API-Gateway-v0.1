@@ -1,0 +1,17 @@
+# Copy these settings into api-gateway/.env only.
+# Keep backend/.env independent; never commit real credentials.
+AIVEN_REDIS_URI=rediss://<username>:<password>@<host>:<port>/<db>
+GATEWAY_API_KEY=<random-client-secret-at-least-24-characters>
+GATEWAY_ADMIN_API_KEY=<different-random-admin-secret-at-least-24-characters>
+JINA_API_KEYS=["jina_key_01","jina_key_02"]
+JINA_BASE_URL=https://api.jina.ai/v1
+JINA_EMBEDDING_MODEL=jina-embeddings-v5-text-small
+JINA_EMBEDDING_DIMENSIONS=1024
+JINA_RERANKER_MODEL=jina-reranker-v2-base-multilingual
+JINA_TIMEOUT_SECONDS=90
+GATEWAY_REDIS_PREFIX=savira:gateway
+GATEWAY_ROTATION_TTL_SECONDS=86400
+GATEWAY_METRICS_TTL_SECONDS=2592000
+COOLDOWN_BASE_SECONDS=60
+COOLDOWN_MAX_SECONDS=3600
+TRANSIENT_COOLDOWN_SECONDS=15
