@@ -21,6 +21,8 @@ def configured(monkeypatch):
     monkeypatch.setenv("GATEWAY_API_KEY", "g" * 32)
     monkeypatch.setenv("GATEWAY_ADMIN_API_KEY", "a" * 32)
     monkeypatch.setenv("GATEWAY_MAX_ATTEMPTS", "3")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_IDS", json.dumps(["cf-account-01", "cf-account-02"]))
+    monkeypatch.setenv("CLOUDFLARE_API_TOKENS", json.dumps(["cf-token-01", "cf-token-02"]))
     # Each test gets an isolated namespace in the real Aiven Redis instance.
     monkeypatch.setenv("GATEWAY_REDIS_PREFIX", f"savira:gateway:pytest:{uuid.uuid4().hex}")
     get_settings.cache_clear()
@@ -289,3 +291,137 @@ async def test_metrics_have_configured_ttl(configured, redis):
         await gateway.metric("ttl_check")
     ttl = await redis.ttl(f"{configured.redis_prefix}:gateway:metrics:ttl_check")
     assert 0 < ttl <= configured.metrics_ttl_seconds
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_rerank_maps_payload_and_fails_over_by_paired_account(configured, redis):
+    from fastapi import FastAPI
+    from app.routers.proxy import router
+    from app.database.redis_client import get_redis
+
+    app = FastAPI()
+    app.include_router(router)
+
+    async def fake_redis():
+        return redis
+
+    app.dependency_overrides[get_redis] = fake_redis
+    calls = []
+
+    async def handler(request):
+        calls.append({
+            "url": str(request.url),
+            "token": request.headers["Authorization"],
+            "payload": json.loads(request.content),
+        })
+        if len(calls) == 1:
+            return httpx.Response(429, headers={"Retry-After": "1"}, json={"success": False, "errors": [{"message": "rate limited"}]})
+        return httpx.Response(200, json={"success": True, "result": {"response": [{"id": 1, "score": 0.91}]}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as provider_client:
+        app.state.http = provider_client
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway") as client:
+            response = await client.post(
+                "/v1/cloudflare/rerank",
+                headers={"Authorization": "Bearer " + "g" * 32},
+                json={"query": "question", "documents": ["first", "second"], "top_n": 1},
+            )
+
+    assert response.status_code == 200
+    assert len(calls) == 2
+    assert calls[0]["url"].endswith("/accounts/cf-account-01/ai/run/@cf/baai/bge-reranker-base")
+    assert calls[0]["token"] == "Bearer cf-token-01"
+    assert calls[1]["url"].endswith("/accounts/cf-account-02/ai/run/@cf/baai/bge-reranker-base")
+    assert calls[1]["token"] == "Bearer cf-token-02"
+    assert calls[0]["payload"] == {
+        "query": "question",
+        "contexts": [{"text": "first"}, {"text": "second"}],
+        "top_k": 1,
+    }
+    assert response.json()["result"]["response"][0]["id"] == 1
+
+
+def test_cloudflare_account_and_token_arrays_pair_by_index(configured):
+    assert configured.cloudflare_accounts == (
+        ("cf-account-01", "cf-token-01"),
+        ("cf-account-02", "cf-token-02"),
+    )
+    assert configured.cloudflare_reranker_model == "@cf/baai/bge-reranker-base"
+
+
+def test_cloudflare_account_and_token_array_lengths_must_match(configured, monkeypatch):
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_IDS", json.dumps(["only-one-account"]))
+    monkeypatch.setenv("CLOUDFLARE_API_TOKENS", json.dumps(["token-one", "token-two"]))
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="equal, non-zero lengths"):
+            get_settings()
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_embeddings_route_uses_paired_accounts_and_fixed_model(configured, redis):
+    from fastapi import FastAPI
+    from app.routers.proxy import router
+    from app.database.redis_client import get_redis
+
+    app = FastAPI()
+    app.include_router(router)
+
+    async def fake_redis():
+        return redis
+
+    app.dependency_overrides[get_redis] = fake_redis
+    calls = []
+
+    async def handler(request):
+        calls.append({
+            "url": str(request.url),
+            "token": request.headers["Authorization"],
+            "payload": json.loads(request.content),
+        })
+        if len(calls) == 1:
+            return httpx.Response(404, json={"errors": [{"code": 7003, "message": "invalid account route"}]})
+        return httpx.Response(
+            200,
+            json={"data": [{"index": 0, "embedding": [0.1] * 1024}]},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as provider_client:
+        app.state.http = provider_client
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+        ) as client:
+            response = await client.post(
+                "/v1/cloudflare/embeddings",
+                headers={"Authorization": "Bearer " + "g" * 32},
+                json={"model": "caller-model", "input": ["hello"]},
+            )
+
+    assert response.status_code == 200
+    assert len(calls) == 2
+    assert calls[0]["url"].endswith("/accounts/cf-account-01/ai/v1/embeddings")
+    assert calls[0]["token"] == "Bearer cf-token-01"
+    assert calls[1]["url"].endswith("/accounts/cf-account-02/ai/v1/embeddings")
+    assert calls[1]["token"] == "Bearer cf-token-02"
+    assert calls[1]["payload"] == {
+        "model": "@cf/qwen/qwen3-embedding-0.6b",
+        "input": ["hello"],
+    }
+    assert len(response.json()["data"][0]["embedding"]) == 1024
+
+
+
+def test_cloudflare_account_and_token_lists_accept_unquoted_env_values(configured, monkeypatch):
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_IDS", "[cf-account-a, cf-account-b]")
+    monkeypatch.setenv("CLOUDFLARE_API_TOKENS", "[cf-token-a, cf-token-b]")
+    get_settings.cache_clear()
+    try:
+        settings = get_settings()
+        assert settings.cloudflare_accounts == (
+            ("cf-account-a", "cf-token-a"),
+            ("cf-account-b", "cf-token-b"),
+        )
+    finally:
+        get_settings.cache_clear()

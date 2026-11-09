@@ -31,4 +31,14 @@ app.include_router(admin_router)
 async def health():
     redis = await get_redis()
     await redis.ping()
-    return {"status":"ok","redis":"ok","provider":"jina"}
+    settings = get_settings()
+    return {
+        "status": "ok",
+        "redis": "ok",
+        "provider": "jina",
+        "providers": {
+            "jina": True,
+            "cloudflare": bool(settings.cloudflare_accounts),
+        },
+        "cloudflare_account_pairs": len(settings.cloudflare_accounts),
+    }

@@ -44,11 +44,49 @@ class Settings:
     cooldown_max_seconds: int
     transient_cooldown_seconds: int
     keys: tuple[str, ...] = field(repr=False)
+    cloudflare_accounts: tuple[tuple[str, str], ...] = field(repr=False)
+    cloudflare_reranker_model: str
+    cloudflare_embedding_model: str
+
+
+def _parse_cloudflare_accounts() -> tuple[tuple[str, str], ...]:
+    raw_ids = os.getenv("CLOUDFLARE_ACCOUNT_IDS", "").strip()
+    raw_tokens = os.getenv("CLOUDFLARE_API_TOKENS", "").strip()
+    if not raw_ids and not raw_tokens:
+        return ()
+    if not raw_ids or not raw_tokens:
+        raise RuntimeError("Set both CLOUDFLARE_ACCOUNT_IDS and CLOUDFLARE_API_TOKENS.")
+    def parse_list(raw: str, variable: str) -> list[str]:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            # Also accept bracketed/comma-separated .env values without quotes.
+            normalized = raw.strip()
+            if normalized.startswith("[") and normalized.endswith("]"):
+                normalized = normalized[1:-1]
+            parsed = [item.strip().strip("\"\'") for item in normalized.split(",")]
+        if not isinstance(parsed, list) or not parsed:
+            raise RuntimeError(f"{variable} must be a non-empty list.")
+        return parsed
+
+    account_ids = parse_list(raw_ids, "CLOUDFLARE_ACCOUNT_IDS")
+    api_tokens = parse_list(raw_tokens, "CLOUDFLARE_API_TOKENS")
+    if not account_ids or len(account_ids) != len(api_tokens):
+        raise RuntimeError("Cloudflare account ID and API token arrays must have equal, non-zero lengths.")
+    pairs = []
+    for index, (account_id, token) in enumerate(zip(account_ids, api_tokens, strict=True)):
+        if not isinstance(account_id, str) or not account_id.strip():
+            raise RuntimeError(f"CLOUDFLARE_ACCOUNT_IDS[{index}] must be a non-empty string.")
+        if not isinstance(token, str) or not token.strip():
+            raise RuntimeError(f"CLOUDFLARE_API_TOKENS[{index}] must be a non-empty string.")
+        pairs.append((account_id.strip(), token.strip()))
+    return tuple(pairs)
 
 
 @lru_cache
 def get_settings() -> Settings:
     keys = _parse_keys()
+    cloudflare_accounts = _parse_cloudflare_accounts()
     redis_url = os.getenv("AIVEN_REDIS_URI", "").strip() or os.getenv("REDIS_URL", "").strip()
     if not redis_url:
         raise RuntimeError(
@@ -79,4 +117,7 @@ def get_settings() -> Settings:
         cooldown_max_seconds=max(1, int(os.getenv("COOLDOWN_MAX_SECONDS", "3600"))),
         transient_cooldown_seconds=max(1, int(os.getenv("TRANSIENT_COOLDOWN_SECONDS", "15"))),
         keys=keys,
+        cloudflare_accounts=cloudflare_accounts,
+        cloudflare_reranker_model=os.getenv("CLOUDFLARE_RERANKER_MODEL", "@cf/baai/bge-reranker-base"),
+        cloudflare_embedding_model=os.getenv("CLOUDFLARE_EMBEDDING_MODEL", "@cf/qwen/qwen3-embedding-0.6b"),
     )
