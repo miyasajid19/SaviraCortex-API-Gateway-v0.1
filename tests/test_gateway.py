@@ -5,11 +5,16 @@ import uuid
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from redis.asyncio import Redis
 
 from app.config import get_settings
+from app.database.redis_client import get_redis
+from app.routers.admin import router as admin_router
 from app.services.key_manager import KeyManager, fingerprint
 from app.services.failover import JinaFailover, GatewayError, retry_after_seconds
+from app.services.fastocr_failover import FastOCRFailover
+from app.services.fastocr_key_manager import FastOCRKeyManager
 
 
 @pytest.fixture
@@ -21,6 +26,7 @@ def configured(monkeypatch):
     monkeypatch.setenv("GATEWAY_API_KEY", "g" * 32)
     monkeypatch.setenv("GATEWAY_ADMIN_API_KEY", "a" * 32)
     monkeypatch.setenv("GATEWAY_MAX_ATTEMPTS", "3")
+    monkeypatch.setenv("FASTOCR_API_KEYS", json.dumps(["fastocr-account-key-01", "fastocr-account-key-02", "fastocr-account-key-03"]))
     monkeypatch.setenv("CLOUDFLARE_ACCOUNT_IDS", json.dumps(["cf-account-01", "cf-account-02"]))
     monkeypatch.setenv("CLOUDFLARE_API_TOKENS", json.dumps(["cf-token-01", "cf-token-02"]))
     # Each test gets an isolated namespace in the real Aiven Redis instance.
@@ -425,3 +431,370 @@ def test_cloudflare_account_and_token_lists_accept_unquoted_env_values(configure
         )
     finally:
         get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_fastocr_create_rotates_on_per_key_throttle_and_pins_document(configured, redis):
+    seen = []
+
+    async def handler(request):
+        key = request.headers["Authorization"].removeprefix("Bearer ")
+        seen.append(key)
+        if key == configured.fastocr_keys[0]:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "60"},
+                json={"message": "API key request rate limit exceeded"},
+            )
+        return httpx.Response(201, json={"id": "fastocr-doc-001"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await FastOCRFailover(redis, client).request(
+            "POST",
+            "/v1/documents",
+            content=b'{"filename":"selected-pages.pdf"}',
+            headers={
+                "content-type": "application/json",
+                "idempotency-key": "fastocr-create-001",
+            },
+            remember_document=True,
+        )
+
+    assert result[0] == 201
+    assert seen == list(configured.fastocr_keys[:2])
+    manager = FastOCRKeyManager(redis)
+    assert await manager.document_key_id("fastocr-doc-001") == fingerprint(configured.fastocr_keys[1])
+    assert await manager.key_for_idempotency("fastocr-create-001") == fingerprint(configured.fastocr_keys[1])
+    states = {item["id"]: item for item in await manager.snapshot()}
+    assert states[fingerprint(configured.fastocr_keys[0])]["status"] == "COOLDOWN"
+
+
+@pytest.mark.asyncio
+async def test_fastocr_document_requests_stay_on_creating_account(configured, redis):
+    manager = FastOCRKeyManager(redis)
+    expected_key = configured.fastocr_keys[1]
+    await manager.bind_document("fastocr-doc-sticky", fingerprint(expected_key))
+    seen = []
+
+    async def handler(request):
+        seen.append(request.headers["Authorization"])
+        return httpx.Response(200, json={"id": "fastocr-doc-sticky", "status": "completed"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await FastOCRFailover(redis, client).request(
+            "GET",
+            "/v1/documents/fastocr-doc-sticky",
+            document_id="fastocr-doc-sticky",
+        )
+
+    assert result[0] == 200
+    assert seen == [f"Bearer {expected_key}"]
+
+
+@pytest.mark.asyncio
+async def test_fastocr_source_address_limit_applies_provider_wide(configured, redis):
+    calls = []
+
+    async def handler(request):
+        calls.append(request)
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "30", "X-RateLimit-Scope": "source_address"},
+            json={"error": {"code": "throttled", "message": "source address throttle"}},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway = FastOCRFailover(redis, client)
+        first = await gateway.request("GET", "/v1/documents")
+        assert first[0] == 429
+        with pytest.raises(GatewayError) as caught:
+            await gateway.request("GET", "/v1/documents")
+
+    assert len(calls) == 1
+    assert caught.value.status_code == 429
+    assert 0 < caught.value.retry_after <= 30
+    assert await FastOCRKeyManager(redis).provider_cooldown_remaining() > 0
+
+
+@pytest.mark.asyncio
+async def test_fastocr_account_concurrency_limit_keeps_document_key(configured, redis):
+    manager = FastOCRKeyManager(redis)
+    expected_key = configured.fastocr_keys[0]
+    kid = fingerprint(expected_key)
+    await manager.bind_document("fastocr-doc-busy", kid)
+    seen = []
+
+    async def handler(request):
+        seen.append(request.headers["Authorization"])
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "20"},
+            json={"error": {"code": "concurrency_limit", "message": "two documents already processing"}},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await FastOCRFailover(redis, client).request(
+            "POST",
+            "/v1/documents/fastocr-doc-busy/start",
+            document_id="fastocr-doc-busy",
+        )
+
+    assert result[0] == 429
+    assert seen == [f"Bearer {expected_key}"]
+    assert (await manager.key_state(kid))["status"] == "COOLDOWN"
+    assert await manager.provider_cooldown_remaining() == 0
+
+
+@pytest.mark.asyncio
+async def test_fastocr_create_network_retry_reuses_idempotent_account(configured, redis):
+    seen = []
+
+    async def handler(request):
+        key = request.headers["Authorization"].removeprefix("Bearer ")
+        seen.append(key)
+        if len(seen) == 1:
+            raise httpx.ConnectError("ambiguous create timeout", request=request)
+        return httpx.Response(201, json={"id": "fastocr-doc-retry"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway = FastOCRFailover(redis, client)
+        kwargs = {
+            "method": "POST",
+            "path": "/v1/documents",
+            "content": b'{"filename":"selected-pages.pdf"}',
+            "headers": {
+                "content-type": "application/json",
+                "idempotency-key": "fastocr-create-retry",
+            },
+            "remember_document": True,
+        }
+        with pytest.raises(GatewayError) as caught:
+            await gateway.request(**kwargs)
+        assert caught.value.status_code == 503
+        pinned = await FastOCRKeyManager(redis).key_for_idempotency("fastocr-create-retry")
+        result = await gateway.request(**kwargs)
+
+    assert result[0] == 201
+    assert seen == [configured.fastocr_keys[0], configured.fastocr_keys[0]]
+    assert pinned == fingerprint(configured.fastocr_keys[0])
+
+
+@pytest.mark.asyncio
+async def test_fastocr_document_route_uses_gateway_auth_and_rotated_provider_key(configured, redis):
+    from fastapi import FastAPI
+    from app.database.redis_client import get_redis
+    from app.routers.proxy import router
+
+    app = FastAPI()
+    app.include_router(router)
+
+    async def fake_redis():
+        return redis
+
+    app.dependency_overrides[get_redis] = fake_redis
+    provider_seen = {}
+
+    async def handler(request):
+        provider_seen["url"] = str(request.url)
+        provider_seen["authorization"] = request.headers["Authorization"]
+        provider_seen["idempotency_key"] = request.headers.get("idempotency-key")
+        provider_seen["body"] = request.content
+        return httpx.Response(201, json={"id": "fastocr-route-doc"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as provider_client:
+        app.state.fastocr_http = provider_client
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+        ) as client:
+            response = await client.post(
+                "/v1/documents",
+                headers={
+                    "Authorization": "Bearer " + "g" * 32,
+                    "Idempotency-Key": "fastocr-route-idem",
+                },
+                json={"filename": "selected-pages.pdf", "size_bytes": 1234},
+            )
+
+    assert response.status_code == 201
+    assert provider_seen["url"] == "https://api.fastocr.org/v1/documents"
+    assert provider_seen["authorization"] == f"Bearer {configured.fastocr_keys[0]}"
+    assert provider_seen["idempotency_key"] == "fastocr-route-idem"
+    assert json.loads(provider_seen["body"])["filename"] == "selected-pages.pdf"
+    assert await FastOCRKeyManager(redis).document_key_id("fastocr-route-doc") == fingerprint(configured.fastocr_keys[0])
+
+
+@pytest.mark.asyncio
+async def test_fastocr_page_quota_failure_does_not_rotate_accounts(configured, redis):
+    calls = []
+
+    async def handler(request):
+        calls.append(request)
+        return httpx.Response(
+            403,
+            json={"error": {"code": "buy_pages", "message": "monthly page balance exhausted"}},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await FastOCRFailover(redis, client).request(
+            "POST",
+            "/v1/documents",
+            content=b'{"filename":"selected-pages.pdf"}',
+            headers={
+                "content-type": "application/json",
+                "idempotency-key": "fastocr-page-quota",
+            },
+            remember_document=True,
+        )
+
+    assert result[0] == 403
+    assert len(calls) == 1
+    states = {item["id"]: item for item in await FastOCRKeyManager(redis).snapshot()}
+    assert all(item["status"] == "ACTIVE" for item in states.values())
+    assert int(await redis.get(f"{configured.redis_prefix}:gateway:metrics:fastocr_quota_exhausted")) == 1
+
+
+@pytest.mark.asyncio
+async def test_fastocr_concurrency_cooldown_preserves_retry_code(configured, redis):
+    manager = FastOCRKeyManager(redis)
+    kid = fingerprint(configured.fastocr_keys[0])
+    await manager.bind_document("fastocr-doc-concurrency-code", kid)
+
+    async def handler(request):
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "30"},
+            json={
+                "error": {
+                    "code": "concurrency_limit",
+                    "message": "two documents already processing",
+                }
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway = FastOCRFailover(redis, client)
+        first = await gateway.request(
+            "POST",
+            "/v1/documents/fastocr-doc-concurrency-code/start",
+            document_id="fastocr-doc-concurrency-code",
+        )
+        with pytest.raises(GatewayError) as caught:
+            await gateway.request(
+                "POST",
+                "/v1/documents/fastocr-doc-concurrency-code/start",
+                document_id="fastocr-doc-concurrency-code",
+            )
+
+    assert first[0] == 429
+    assert caught.value.status_code == 429
+    assert caught.value.code == "concurrency_limit"
+    assert caught.value.retry_after > 0
+
+
+# FastOCR admin endpoint coverage shares the configured/Redis fixtures above.
+@pytest.mark.asyncio
+async def test_fastocr_admin_status_and_reenable_key(configured, redis):
+    app = FastAPI()
+    app.include_router(admin_router)
+
+    async def fake_redis():
+        return redis
+
+    app.dependency_overrides[get_redis] = fake_redis
+    manager = FastOCRKeyManager(redis)
+    disabled_kid = fingerprint(configured.fastocr_keys[0])
+    await manager.disable(disabled_kid, "test invalid key")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://gateway",
+    ) as client:
+        status = await client.get(
+            "/admin/fastocr/status",
+            headers={"X-Admin-Key": configured.admin_api_key},
+        )
+        enabled = await client.post(
+            f"/admin/fastocr/keys/{disabled_kid}/enable",
+            headers={"X-Admin-Key": configured.admin_api_key},
+        )
+
+    assert status.status_code == 200
+    body = status.json()
+    assert body["provider"] == "FastOCR"
+    assert body["configured"] is True
+    assert body["key_counts"]["total"] == len(configured.fastocr_keys)
+    assert body["key_counts"]["disabled"] == 1
+    assert "concurrency_limit" in body["metrics"]
+    assert all(configured_key not in str(body) for configured_key in configured.fastocr_keys)
+    assert enabled.status_code == 200
+    assert enabled.json() == {"id": disabled_kid, "status": "ACTIVE"}
+    assert (await manager.key_state(disabled_kid))["status"] == "ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_fastocr_proxy_preserves_concurrency_error_code(configured, redis):
+    from app.routers.proxy import router as proxy_router
+
+    app = FastAPI()
+    app.include_router(proxy_router)
+
+    async def fake_redis():
+        return redis
+
+    app.dependency_overrides[get_redis] = fake_redis
+    manager = FastOCRKeyManager(redis)
+    kid = fingerprint(configured.fastocr_keys[0])
+    await manager.bind_document("fastocr-doc-proxy-cooldown", kid)
+    await manager.set_cooldown(kid, 30, "account concurrency limit")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(500)
+        )
+    ) as provider_client:
+        app.state.fastocr_http = provider_client
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://gateway",
+        ) as client:
+            response = await client.post(
+                "/v1/documents/fastocr-doc-proxy-cooldown/start",
+                headers={"Authorization": "Bearer " + "g" * 32},
+            )
+
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == "concurrency_limit"
+    assert int(response.headers["Retry-After"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_fastocr_sticky_monthly_page_quota_does_not_disable_key(configured, redis):
+    manager = FastOCRKeyManager(redis)
+    kid = fingerprint(configured.fastocr_keys[0])
+    await manager.bind_document("fastocr-doc-sticky-buy-pages", kid)
+
+    async def handler(request):
+        return httpx.Response(
+            403,
+            json={
+                "error": {
+                    "code": "buy_pages",
+                    "message": "monthly page allowance exhausted",
+                }
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await FastOCRFailover(redis, client).request(
+            "POST",
+            "/v1/documents/fastocr-doc-sticky-buy-pages/start",
+            document_id="fastocr-doc-sticky-buy-pages",
+        )
+
+    assert result[0] == 403
+    assert (await manager.key_state(kid))["status"] == "ACTIVE"
+    assert int(
+        await redis.get(
+            f"{configured.redis_prefix}:gateway:metrics:fastocr_quota_exhausted"
+        )
+    ) == 1

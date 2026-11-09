@@ -9,6 +9,7 @@ from redis.asyncio import Redis
 from app.config import get_settings
 from app.database.redis_client import get_redis
 from app.services.key_manager import KeyManager
+from app.services.fastocr_key_manager import FastOCRKeyManager
 
 router = APIRouter(prefix="/admin")
 
@@ -31,7 +32,7 @@ async def status(x_admin_key: str | None = Header(default=None), redis: Redis = 
     names = (
         "requests", "success", "failed", "rate_limited", "shared_quota_limited",
         "automatic_failovers", "disabled_keys", "provider_errors", "network_errors",
-        "client_errors", "latency_ms_total",
+        "client_errors", "quota_exhausted", "concurrency_limit", "latency_ms_total",
     )
     metrics = {
         name: int(
@@ -72,6 +73,66 @@ async def enable(
         await KeyManager(redis).enable(kid)
     except KeyError:
         raise HTTPException(404, "Unknown configured key fingerprint.")
+    return {"id": kid, "status": "ACTIVE"}
+
+
+@router.get("/fastocr/status")
+async def fastocr_status(
+    x_admin_key: str | None = Header(default=None),
+    redis: Redis = Depends(get_redis),
+):
+    authorize(x_admin_key)
+    settings = get_settings()
+    manager = FastOCRKeyManager(redis)
+    keys = await manager.snapshot()
+    selected = await redis.get(f"{settings.redis_prefix}:fastocr:last_selected")
+    names = (
+        "requests", "success", "failed", "rate_limited", "shared_rate_limited",
+        "automatic_failovers", "disabled_keys", "provider_errors", "network_errors",
+        "client_errors", "quota_exhausted", "concurrency_limit", "latency_ms_total",
+    )
+    metrics = {
+        name: int(
+            await redis.get(
+                f"{settings.redis_prefix}:gateway:metrics:fastocr_{name}"
+            ) or 0
+        )
+        for name in names
+    }
+    metrics["average_latency_ms"] = round(
+        metrics["latency_ms_total"] / max(1, metrics["success"]), 2
+    )
+    return {
+        "provider": "FastOCR",
+        "configured": bool(settings.fastocr_keys),
+        "key_counts": {
+            "total": len(keys),
+            "active": sum(key["status"] == "ACTIVE" for key in keys),
+            "cooldown": sum(key["status"] == "COOLDOWN" for key in keys),
+            "disabled": sum(key["status"] == "DISABLED" for key in keys),
+        },
+        "current_selected_key": next(
+            (key for key in keys if key["id"] == selected), None
+        ),
+        "provider_cooldown_remaining_seconds": (
+            await manager.provider_cooldown_remaining()
+        ),
+        "keys": keys,
+        "metrics": metrics,
+    }
+
+
+@router.post("/fastocr/keys/{kid}/enable")
+async def enable_fastocr_key(
+    kid: str,
+    x_admin_key: str | None = Header(default=None),
+    redis: Redis = Depends(get_redis),
+):
+    authorize(x_admin_key)
+    try:
+        await FastOCRKeyManager(redis).enable(kid)
+    except KeyError:
+        raise HTTPException(404, "Unknown configured FastOCR key fingerprint.")
     return {"id": kid, "status": "ACTIVE"}
 
 

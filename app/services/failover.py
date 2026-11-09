@@ -12,8 +12,17 @@ from app.services.key_manager import KeyManager
 
 
 class GatewayError(Exception):
-    def __init__(self, status_code: int, message: str, retry_after: int | None = None):
-        self.status_code, self.message, self.retry_after = status_code, message, retry_after
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        retry_after: int | None = None,
+        code: str | None = None,
+    ):
+        self.status_code = status_code
+        self.message = message
+        self.retry_after = retry_after
+        self.code = code
         super().__init__(message)
 
 

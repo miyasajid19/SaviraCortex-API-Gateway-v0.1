@@ -1,12 +1,14 @@
 from __future__ import annotations
 import hmac
 import httpx
+from urllib.parse import quote
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from redis.asyncio import Redis
 from app.config import get_settings
 from app.database.redis_client import get_redis
 from app.services.failover import JinaFailover, GatewayError
+from app.services.fastocr_failover import FastOCRFailover
 
 router = APIRouter(prefix="/v1")
 
@@ -49,6 +51,125 @@ async def rerank(request: Request, authorization: str | None=Header(default=None
         raise HTTPException(400, "Request must contain query and documents.")
     payload["model"] = get_settings().jina_reranker_model
     return await _proxy(request, "/rerank", payload, authorization, redis)
+
+
+async def _fastocr_proxy(
+    request: Request,
+    path: str,
+    authorization: str | None,
+    redis: Redis,
+    *,
+    document_id: str | None = None,
+    remember_document: bool = False,
+):
+    require_gateway_key(authorization)
+    if not get_settings().fastocr_keys:
+        raise HTTPException(
+            503,
+            detail={
+                "error": {
+                    "message": "No FastOCR API keys configured. Set FASTOCR_API_KEYS in api-gateway/.env.",
+                    "type": "configuration_error",
+                }
+            },
+        )
+
+    forwarded_headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() in {"content-type", "accept", "idempotency-key", "user-agent"}
+    }
+    engine = FastOCRFailover(redis, request.app.state.fastocr_http)
+    try:
+        status, headers, raw = await engine.request(
+            request.method,
+            path,
+            params=list(request.query_params.multi_items()),
+            content=await request.body(),
+            headers=forwarded_headers,
+            document_id=document_id,
+            remember_document=remember_document,
+        )
+    except GatewayError as exc:
+        error = {"message": exc.message, "type": "provider_unavailable"}
+        if exc.code:
+            error["code"] = exc.code
+        response = JSONResponse(
+            status_code=exc.status_code,
+            content={"error": error},
+        )
+        if exc.retry_after:
+            response.headers["Retry-After"] = str(exc.retry_after)
+        return response
+
+    return Response(
+        content=raw,
+        status_code=status,
+        headers=headers,
+    )
+
+
+@router.api_route("/documents", methods=["GET", "POST"])
+async def fastocr_documents(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    redis: Redis = Depends(get_redis),
+):
+    return await _fastocr_proxy(
+        request,
+        "/v1/documents",
+        authorization,
+        redis,
+        remember_document=request.method.upper() == "POST",
+    )
+
+
+@router.api_route("/documents/{document_id}", methods=["GET", "DELETE"])
+async def fastocr_document(
+    document_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    redis: Redis = Depends(get_redis),
+):
+    return await _fastocr_proxy(
+        request,
+        f"/v1/documents/{quote(document_id, safe='')}",
+        authorization,
+        redis,
+        document_id=document_id,
+    )
+
+
+@router.post("/documents/{document_id}/start")
+async def fastocr_start_document(
+    document_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    redis: Redis = Depends(get_redis),
+):
+    return await _fastocr_proxy(
+        request,
+        f"/v1/documents/{quote(document_id, safe='')}/start",
+        authorization,
+        redis,
+        document_id=document_id,
+    )
+
+
+@router.get("/documents/{document_id}/output")
+async def fastocr_document_output(
+    document_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    redis: Redis = Depends(get_redis),
+):
+    return await _fastocr_proxy(
+        request,
+        f"/v1/documents/{quote(document_id, safe='')}/output",
+        authorization,
+        redis,
+        document_id=document_id,
+    )
 
 
 @router.post("/cloudflare/rerank")

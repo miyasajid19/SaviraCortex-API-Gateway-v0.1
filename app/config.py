@@ -13,8 +13,8 @@ _GATEWAY_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(_GATEWAY_DIR / ".env", override=False)
 
 
-def _parse_keys() -> tuple[str, ...]:
-    raw = os.getenv("JINA_API_KEYS", "").strip() or os.getenv("JINA_API_KEY", "").strip()
+def _parse_key_list(primary_name: str, fallback_name: str) -> tuple[str, ...]:
+    raw = os.getenv(primary_name, "").strip() or os.getenv(fallback_name, "").strip()
     if not raw:
         return ()
     try:
@@ -24,6 +24,14 @@ def _parse_keys() -> tuple[str, ...]:
     except json.JSONDecodeError:
         pass
     return tuple(dict.fromkeys(v.strip() for v in raw.split(",") if v.strip()))
+
+
+def _parse_keys() -> tuple[str, ...]:
+    return _parse_key_list("JINA_API_KEYS", "JINA_API_KEY")
+
+
+def _parse_fastocr_keys() -> tuple[str, ...]:
+    return _parse_key_list("FASTOCR_API_KEYS", "FASTOCR_API_KEY")
 
 
 @dataclass(frozen=True)
@@ -44,6 +52,14 @@ class Settings:
     cooldown_max_seconds: int
     transient_cooldown_seconds: int
     keys: tuple[str, ...] = field(repr=False)
+    fastocr_keys: tuple[str, ...] = field(repr=False)
+    fastocr_base_url: str
+    fastocr_timeout_seconds: float
+    fastocr_max_attempts: int
+    fastocr_cooldown_base_seconds: int
+    fastocr_cooldown_max_seconds: int
+    fastocr_transient_cooldown_seconds: int
+    fastocr_document_key_ttl_seconds: int
     cloudflare_accounts: tuple[tuple[str, str], ...] = field(repr=False)
     cloudflare_reranker_model: str
     cloudflare_embedding_model: str
@@ -86,6 +102,7 @@ def _parse_cloudflare_accounts() -> tuple[tuple[str, str], ...]:
 @lru_cache
 def get_settings() -> Settings:
     keys = _parse_keys()
+    fastocr_keys = _parse_fastocr_keys()
     cloudflare_accounts = _parse_cloudflare_accounts()
     redis_url = os.getenv("AIVEN_REDIS_URI", "").strip() or os.getenv("REDIS_URL", "").strip()
     if not redis_url:
@@ -117,6 +134,14 @@ def get_settings() -> Settings:
         cooldown_max_seconds=max(1, int(os.getenv("COOLDOWN_MAX_SECONDS", "3600"))),
         transient_cooldown_seconds=max(1, int(os.getenv("TRANSIENT_COOLDOWN_SECONDS", "15"))),
         keys=keys,
+        fastocr_keys=fastocr_keys,
+        fastocr_base_url=os.getenv("FASTOCR_BASE_URL", "https://api.fastocr.org").rstrip("/"),
+        fastocr_timeout_seconds=max(1.0, float(os.getenv("FASTOCR_TIMEOUT_SECONDS", "90"))),
+        fastocr_max_attempts=max(1, int(os.getenv("FASTOCR_MAX_ATTEMPTS", str(max(1, len(fastocr_keys)))))),
+        fastocr_cooldown_base_seconds=max(1, int(os.getenv("FASTOCR_COOLDOWN_BASE_SECONDS", "30"))),
+        fastocr_cooldown_max_seconds=max(1, int(os.getenv("FASTOCR_COOLDOWN_MAX_SECONDS", "900"))),
+        fastocr_transient_cooldown_seconds=max(1, int(os.getenv("FASTOCR_TRANSIENT_COOLDOWN_SECONDS", "15"))),
+        fastocr_document_key_ttl_seconds=max(300, int(os.getenv("FASTOCR_DOCUMENT_KEY_TTL_SECONDS", "86400"))),
         cloudflare_accounts=cloudflare_accounts,
         cloudflare_reranker_model=os.getenv("CLOUDFLARE_RERANKER_MODEL", "@cf/baai/bge-reranker-base"),
         cloudflare_embedding_model=os.getenv("CLOUDFLARE_EMBEDDING_MODEL", "@cf/qwen/qwen3-embedding-0.6b"),

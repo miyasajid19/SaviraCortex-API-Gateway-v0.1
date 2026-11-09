@@ -18,8 +18,10 @@ async def lifespan(app: FastAPI):
     if settings.jina_embedding_dimensions < 1:
         raise RuntimeError("JINA_EMBEDDING_DIMENSIONS must be positive.")
     app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(settings.jina_timeout_seconds, connect=10), follow_redirects=False)
+    app.state.fastocr_http = httpx.AsyncClient(timeout=httpx.Timeout(settings.fastocr_timeout_seconds, connect=10), follow_redirects=False)
     await get_redis()
     yield
+    await app.state.fastocr_http.aclose()
     await app.state.http.aclose()
     await close_redis()
 
@@ -39,6 +41,8 @@ async def health():
         "providers": {
             "jina": True,
             "cloudflare": bool(settings.cloudflare_accounts),
+            "fastocr": bool(settings.fastocr_keys),
         },
         "cloudflare_account_pairs": len(settings.cloudflare_accounts),
+        "fastocr_key_count": len(settings.fastocr_keys),
     }

@@ -9,6 +9,15 @@ JINA_EMBEDDING_MODEL=jina-embeddings-v5-text-small
 JINA_EMBEDDING_DIMENSIONS=1024
 JINA_RERANKER_MODEL=jina-reranker-v2-base-multilingual
 JINA_TIMEOUT_SECONDS=90
+# Optional FastOCR account-key pool; supports a JSON array or comma-separated values.
+FASTOCR_API_KEYS=["fok_live_account_01","fok_live_account_02"]
+FASTOCR_BASE_URL=https://api.fastocr.org
+FASTOCR_TIMEOUT_SECONDS=90
+FASTOCR_MAX_ATTEMPTS=20
+FASTOCR_COOLDOWN_BASE_SECONDS=30
+FASTOCR_COOLDOWN_MAX_SECONDS=900
+FASTOCR_TRANSIENT_COOLDOWN_SECONDS=15
+FASTOCR_DOCUMENT_KEY_TTL_SECONDS=86400
 CLOUDFLARE_ACCOUNT_IDS=["account_id_01","account_id_02"]
 CLOUDFLARE_API_TOKENS=["api_token_01","api_token_02"]
 CLOUDFLARE_EMBEDDING_MODEL=@cf/qwen/qwen3-embedding-0.6b

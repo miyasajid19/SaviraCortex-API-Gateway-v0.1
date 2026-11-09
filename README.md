@@ -1,6 +1,6 @@
 # Savare Cortex API Gateway
 
-A standalone FastAPI gateway for Jina embeddings/reranking and optional Cloudflare Workers AI embeddings. It keeps provider API credentials private and uses **Aiven Redis as its runtime state store** for Jina key rotation, cooldowns, disabled-key state, backoff, and metrics.
+A standalone FastAPI gateway for Jina embeddings/reranking, optional Cloudflare Workers AI embeddings, and optional FastOCR Document OCR. It keeps provider API credentials private and uses **Aiven Redis as its runtime state store** for provider key rotation, account affinity, cooldowns, disabled-key state, backoff, and metrics.
 
 No in-memory Redis or Docker is used by the running gateway. The gateway connects directly to the configured Aiven Redis instance through `AIVEN_REDIS_URI`.
 
@@ -16,6 +16,22 @@ GATEWAY_API_KEY=<private-client-secret-at-least-24-characters>
 GATEWAY_ADMIN_API_KEY=<different-admin-secret-at-least-24-characters>
 JINA_API_KEYS=["jina_key_01","jina_key_02","jina_key_03"]
 ```
+
+Optional FastOCR Document OCR settings:
+
+~~~dotenv
+# One unique API key per authorized FastOCR account; keep keys only in this gateway environment.
+FASTOCR_API_KEYS=["fok_live_account_01","fok_live_account_02"]
+FASTOCR_BASE_URL=https://api.fastocr.org
+FASTOCR_TIMEOUT_SECONDS=90
+FASTOCR_MAX_ATTEMPTS=20
+FASTOCR_COOLDOWN_BASE_SECONDS=30
+FASTOCR_COOLDOWN_MAX_SECONDS=900
+FASTOCR_TRANSIENT_COOLDOWN_SECONDS=15
+FASTOCR_DOCUMENT_KEY_TTL_SECONDS=86400
+~~~
+
+FastOCR is disabled when no keys are configured; restart the gateway after changing FASTOCR_API_KEYS. Configure one unique provider key per authorized FastOCR account. Each document is pinned to the account key that created it; its start, poll, and output calls stay on that account. Per-key throttles on a new create request rotate to another eligible key. When an account returns concurrency_limit during start, the backend can re-submit the original selected-pages PDF as a new job under the next eligible account, bounded by FASTOCR_MAX_ACCOUNT_FALLBACKS. Shared source-address throttles apply a provider-wide cooldown and are not bypassed. Monthly page-balance failures such as buy_pages never trigger account rotation. Never put FastOCR provider keys in backend/.env.
 
 Optional Cloudflare Workers AI embedding settings:
 
@@ -44,7 +60,7 @@ GATEWAY_METRICS_TTL_SECONDS=2592000
 - Metrics expire after the metrics TTL.
 - Exponential-backoff counters expire after the rotation TTL.
 - A credential rejected with HTTP 401/403 is stored as `DISABLED` without a TTL. This is intentional: an invalid credential must not silently become active again. It is removed only by the admin re-enable action.
-- Raw Jina API keys are **never stored in Redis**. They remain in `api-gateway/.env`; Redis stores only hashed key identifiers and operational state.
+- Raw Jina and FastOCR API keys are **never stored in Redis**. They remain in `api-gateway/.env`; Redis stores only hashed key identifiers and operational state.
 
 Use the exact TLS `rediss://` URI provided by Aiven. Do not paste credentials into source code, logs, README, or chat.
 
@@ -76,11 +92,34 @@ Invoke-RestMethod http://127.0.0.1:8090/health
 - `POST /v1/cloudflare/embeddings` — Cloudflare Workers AI embeddings using Qwen3 Embedding 0.6B.
 - `POST /v1/rerank` — existing Jina reranking proxy (unchanged).
 - `POST /v1/cloudflare/rerank` — Cloudflare Workers AI BGE reranking using `@cf/baai/bge-reranker-base`.
+- `POST /v1/documents`, `GET /v1/documents`, `GET/DELETE /v1/documents/{id}`, `POST /v1/documents/{id}/start`, and `GET /v1/documents/{id}/output` — FastOCR-compatible document API proxy with account-aware key rotation.
 - `GET /admin/status` — Redis-backed Jina key state and metrics; requires `X-Admin-Key`.
 - `POST /admin/keys/{fingerprint}/enable` — re-enable a corrected Jina key; requires admin authentication.
+- `GET /admin/fastocr/status` — FastOCR key state and metrics; requires X-Admin-Key.
+- `POST /admin/fastocr/keys/{fingerprint}/enable` — re-enable a corrected FastOCR key; requires admin authentication.
 - `GET /admin/dashboard` — admin dashboard.
 
 Client requests use `Authorization: Bearer <GATEWAY_API_KEY>`. Provider credentials are never returned to the caller.
+
+### FastOCR Document OCR
+
+The existing backend uses FastOCRLoader with the gateway root URL (without /v1) and the gateway client secret:
+
+~~~python
+from langchain_fastocr import FastOCRLoader
+
+loader = FastOCRLoader(
+    file_path="selected-pages.pdf",
+    api_key="YOUR_GATEWAY_API_KEY",
+    base_url="http://127.0.0.1:8090",
+    output="pdf",
+    timeout=300,
+)
+documents = loader.load()
+~~~
+
+FastOCR provider keys are selected and rotated inside the gateway. The SDK sends document create/start/status/output API calls through the gateway, then transfers the PDF to and from FastOCR's presigned storage URLs directly.
+
 
 ### Jina embeddings (existing endpoint)
 
@@ -161,13 +200,17 @@ The backend can select either provider without changing the gateway client crede
 ```dotenv
 JINA_API_BASE_URL=http://127.0.0.1:8090/v1
 JINA_API_KEY=<same-value-as-GATEWAY_API_KEY>
+FASTOCR_GATEWAY_BASE_URL=http://127.0.0.1:8090
+FASTOCR_GATEWAY_API_KEY=<same-value-as-GATEWAY_API_KEY>
+FASTOCR_PROCESS_TIMEOUT_SECONDS=300
+FASTOCR_MAX_ACCOUNT_FALLBACKS=10
 ```
 
 To use Cloudflare from a client, call `/v1/cloudflare/embeddings` explicitly with the same gateway client credential. The backend's `JINA_API_KEY` is the gateway client credential, not a provider key. Keep actual Jina and Cloudflare provider credentials only in `api-gateway/.env`.
 
 **Important:** Jina and Cloudflare Qwen3 embeddings are different vector spaces even though both are 1,024 dimensions. Do not mix vectors from the two models in one Qdrant collection. Switching a collection to Qwen3 requires a separate collection and a full re-embedding/re-indexing of its documents and query path.
 
-This gateway does not proxy generation traffic. Jina keeps its Redis-backed key rotation and failover. Cloudflare uses its own account token and independent request path; it does not consume or rotate Jina keys.
+This gateway does not proxy generation traffic. Jina keeps its Redis-backed key rotation and failover. Cloudflare uses its own account token and independent request path; it does not consume or rotate Jina keys. FastOCR exposes the provider's `/v1/documents` REST paths so the existing FastOCR SDK can point at the gateway. Only authenticated API calls pass through the gateway; FastOCR's presigned S3 upload and output URLs remain direct, as required by the provider's five-step flow. The gateway pins each document ID and idempotency key to its creating account to prevent cross-account document access and duplicate creates after ambiguous network failures.
 
 ## 5. Jina failover behavior
 
@@ -189,7 +232,7 @@ The automated test suite uses the configured Redis endpoint with unique per-test
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Tests cover Redis-backed atomic reservations, Jina key rotation, rate-limit handling, cooldown expiry, TTL behavior, gateway authentication, and provider request routing. For live provider connectivity, use the provider dashboards/usage tools and gateway health endpoint; do not run quota-exhaustion tests against production credentials.
+Tests cover Redis-backed atomic reservations, Jina and FastOCR key rotation, account affinity, concurrency fallback, monthly page-quota handling, rate-limit cooldowns, TTL behavior, gateway authentication, and provider request routing. For live provider connectivity, use the provider dashboards/usage tools and gateway health endpoint; do not run quota-exhaustion tests against production credentials.
 
 ## 7. Deployment
 
