@@ -34,6 +34,10 @@ def _parse_fastocr_keys() -> tuple[str, ...]:
     return _parse_key_list("FASTOCR_API_KEYS", "FASTOCR_API_KEY")
 
 
+def _parse_opencode_keys() -> tuple[str, ...]:
+    return _parse_key_list("OPENCODE_API_KEYS", "OPENCODE_API_KEY")
+
+
 @dataclass(frozen=True)
 class Settings:
     gateway_api_key: str = field(repr=False)
@@ -52,6 +56,17 @@ class Settings:
     cooldown_max_seconds: int
     transient_cooldown_seconds: int
     keys: tuple[str, ...] = field(repr=False)
+    opencode_keys: tuple[str, ...] = field(repr=False)
+    opencode_jev_model: str
+    opencode_jev_base_url: str
+    opencode_jev_timeout_seconds: float
+    cloudflare_jev_model: str
+    cloudflare_jev_selector: str
+    cloudflare_jev_fast_model: str
+    cloudflare_jev_fast_selector: str
+    cloudflare_jev_omni_model: str
+    cloudflare_jev_omni_selector: str
+    jev_retry_cooldown_seconds: int
     fastocr_keys: tuple[str, ...] = field(repr=False)
     fastocr_base_url: str
     fastocr_timeout_seconds: float
@@ -102,6 +117,7 @@ def _parse_cloudflare_accounts() -> tuple[tuple[str, str], ...]:
 @lru_cache
 def get_settings() -> Settings:
     keys = _parse_keys()
+    opencode_keys = _parse_opencode_keys()
     fastocr_keys = _parse_fastocr_keys()
     cloudflare_accounts = _parse_cloudflare_accounts()
     redis_url = os.getenv("AIVEN_REDIS_URI", "").strip() or os.getenv("REDIS_URL", "").strip()
@@ -134,6 +150,20 @@ def get_settings() -> Settings:
         cooldown_max_seconds=max(1, int(os.getenv("COOLDOWN_MAX_SECONDS", "3600"))),
         transient_cooldown_seconds=max(1, int(os.getenv("TRANSIENT_COOLDOWN_SECONDS", "15"))),
         keys=keys,
+        opencode_keys=opencode_keys,
+        opencode_jev_model=os.getenv("OPENCODE_JEV_MODEL", "jev-1.13-free").strip(),
+        opencode_jev_base_url=os.getenv(
+            "OPENCODE_JEV_BASE_URL",
+            "https://opencode.ai/inference/systemone/v1/systemone",
+        ).strip().rstrip("/"),
+        opencode_jev_timeout_seconds=max(1.0, float(os.getenv("OPENCODE_JEV_TIMEOUT_SECONDS", "60"))),
+        cloudflare_jev_model=os.getenv("CLOUDFLARE_JEV_MODEL", "@cf/cloudflare/clef").strip(),
+        cloudflare_jev_selector=os.getenv("CLOUDFLARE_JEV_SELECTOR", "clef").strip(),
+        cloudflare_jev_fast_model=os.getenv("CLOUDFLARE_JEV_FAST_MODEL", "@cf/cloudflare/clef-flash").strip(),
+        cloudflare_jev_fast_selector=os.getenv("CLOUDFLARE_JEV_FAST_SELECTOR", "clef-flash").strip(),
+        cloudflare_jev_omni_model=os.getenv("CLOUDFLARE_JEV_OMNI_MODEL", "@cf/cloudflare/clef-omni").strip(),
+        cloudflare_jev_omni_selector=os.getenv("CLOUDFLARE_JEV_OMNI_SELECTOR", "clef-omni").strip(),
+        jev_retry_cooldown_seconds=max(1, int(os.getenv("JEV_RETRY_COOLDOWN_SECONDS", "30"))),
         fastocr_keys=fastocr_keys,
         fastocr_base_url=os.getenv("FASTOCR_BASE_URL", "https://api.fastocr.org").rstrip("/"),
         fastocr_timeout_seconds=max(1.0, float(os.getenv("FASTOCR_TIMEOUT_SECONDS", "90"))),

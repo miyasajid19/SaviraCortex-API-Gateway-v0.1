@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import hashlib
 import time
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -134,6 +135,105 @@ async def enable_fastocr_key(
     except KeyError:
         raise HTTPException(404, "Unknown configured FastOCR key fingerprint.")
     return {"id": kid, "status": "ACTIVE"}
+
+
+@router.get("/jev/status")
+async def jev_status(
+    x_admin_key: str | None = Header(default=None),
+    redis: Redis = Depends(get_redis),
+):
+    authorize(x_admin_key)
+    settings = get_settings()
+
+    def fingerprint(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+    async def snapshot(provider: str, credentials: list[tuple[str, str]]):
+        result = []
+        for kid, _label in credentials:
+            key = f"{settings.redis_prefix}:jev:{provider}:credential:{kid}:state"
+            state = await redis.get(key) or "ACTIVE"
+            ttl = int(await redis.ttl(key))
+            result.append({
+                "id": kid,
+                "status": state,
+                "cooldown_remaining_seconds": max(0, ttl) if state == "COOLDOWN" else 0,
+            })
+        return result
+
+    opencode = [(fingerprint(key), "OpenCode key") for key in settings.opencode_keys]
+    cloudflare = [
+        (fingerprint(f"{account_id}:{token}"), "Cloudflare account/token pair")
+        for account_id, token in settings.cloudflare_accounts
+    ]
+    names = (
+        "requests", "opencode_success", "cloudflare_success", "opencode_network_failures",
+        "cloudflare_network_failures", "unavailable",
+    )
+    metrics = {
+        name: int(await redis.get(f"{settings.redis_prefix}:gateway:metrics:jev_{name}") or 0)
+        for name in names
+    }
+    return {
+        "providers": {
+            "opencode": {
+                "model": settings.opencode_jev_model,
+                "configured": bool(opencode),
+                "credentials": await snapshot("opencode", opencode),
+            },
+            "cloudflare": {
+                "standard_model": settings.cloudflare_jev_model,
+                "fast_model": settings.cloudflare_jev_fast_model,
+                "omni_model": settings.cloudflare_jev_omni_model,
+                "configured": bool(cloudflare),
+                "credentials": await snapshot("cloudflare", cloudflare),
+            },
+        },
+        "task_profiles": {
+            "ingestion": {
+                "primary": "cloudflare",
+                "primary_model": settings.cloudflare_jev_fast_model,
+                "fallback": "opencode",
+                "fallback_model": settings.opencode_jev_model,
+            },
+            "runtime": {
+                "primary": "opencode",
+                "primary_model": settings.opencode_jev_model,
+                "fallback": "cloudflare",
+                "fallback_model": settings.cloudflare_jev_model,
+            },
+        },
+        "metrics": metrics,
+    }
+
+
+@router.post("/jev/credentials/{provider}/{kid}/enable")
+async def enable_jev_credential(
+    provider: str,
+    kid: str,
+    x_admin_key: str | None = Header(default=None),
+    redis: Redis = Depends(get_redis),
+):
+    authorize(x_admin_key)
+    settings = get_settings()
+
+    def fingerprint(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+    if provider == "opencode":
+        configured = {fingerprint(key) for key in settings.opencode_keys}
+    elif provider == "cloudflare":
+        configured = {
+            fingerprint(f"{account_id}:{token}")
+            for account_id, token in settings.cloudflare_accounts
+        }
+    else:
+        raise HTTPException(404, "Unknown JEV provider.")
+
+    if kid not in configured:
+        raise HTTPException(404, "Unknown configured JEV credential fingerprint.")
+    await redis.delete(f"{settings.redis_prefix}:jev:{provider}:credential:{kid}:state")
+    return {"provider": provider, "id": kid, "status": "ACTIVE"}
 
 
 @router.get("/dashboard")

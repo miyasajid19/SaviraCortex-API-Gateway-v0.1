@@ -352,6 +352,18 @@ async def models(authorization: str | None=Header(default=None)):
     settings = get_settings()
     return {
         "provider": "jina",
+        "jev": {
+            "opencode_configured": bool(settings.opencode_keys),
+            "opencode_model": settings.opencode_jev_model,
+            "cloudflare_configured": bool(settings.cloudflare_accounts),
+            "cloudflare_model": settings.cloudflare_jev_model,
+            "cloudflare_fast_model": settings.cloudflare_jev_fast_model,
+            "cloudflare_omni_model": settings.cloudflare_jev_omni_model,
+            "task_profiles": {
+                "ingestion": "cloudflare-clef-flash-primary",
+                "runtime": "opencode-jev-primary",
+            },
+        },
         "embeddings": {"model": settings.jina_embedding_model, "dimensions": settings.jina_embedding_dimensions},
         "reranking": {"model": settings.jina_reranker_model},
         "cloudflare": {

@@ -9,6 +9,19 @@ JINA_EMBEDDING_MODEL=jina-embeddings-v5-text-small
 JINA_EMBEDDING_DIMENSIONS=1024
 JINA_RERANKER_MODEL=jina-reranker-v2-base-multilingual
 JINA_TIMEOUT_SECONDS=90
+# JEV primary: OpenCode Console. Supports a JSON array or comma-separated key list.
+OPENCODE_API_KEYS=["opencode_key_01","opencode_key_02"]
+OPENCODE_JEV_MODEL=jev-1.13-free
+OPENCODE_JEV_BASE_URL=https://opencode.ai/inference/systemone/v1/systemone
+OPENCODE_JEV_TIMEOUT_SECONDS=60
+# JEV fallback: reuses the paired Cloudflare account/token pools below.
+CLOUDFLARE_JEV_MODEL=@cf/cloudflare/clef
+CLOUDFLARE_JEV_SELECTOR=clef
+CLOUDFLARE_JEV_FAST_MODEL=@cf/cloudflare/clef-flash
+CLOUDFLARE_JEV_FAST_SELECTOR=clef-flash
+CLOUDFLARE_JEV_OMNI_MODEL=@cf/cloudflare/clef-omni
+CLOUDFLARE_JEV_OMNI_SELECTOR=clef-omni
+JEV_RETRY_COOLDOWN_SECONDS=30
 # Optional FastOCR account-key pool; supports a JSON array or comma-separated values.
 FASTOCR_API_KEYS=["fok_live_account_01","fok_live_account_02"]
 FASTOCR_BASE_URL=https://api.fastocr.org
